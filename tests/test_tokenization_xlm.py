@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors.
+# Copyright 2020 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,15 +18,16 @@ import json
 import os
 import unittest
 
-from transformers.tokenization_xlm import VOCAB_FILES_NAMES, XLMTokenizer
+from transformers.models.xlm.tokenization_xlm import VOCAB_FILES_NAMES, XLMTokenizer
+from transformers.testing_utils import slow
 
 from .test_tokenization_common import TokenizerTesterMixin
-from .utils import slow
 
 
 class XLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
 
     tokenizer_class = XLMTokenizer
+    test_rust_tokenizer = False
 
     def setUp(self):
         super().setUp()
@@ -65,16 +66,13 @@ class XLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         with open(self.merges_file, "w") as fp:
             fp.write("\n".join(merges))
 
-    def get_tokenizer(self, **kwargs):
-        return XLMTokenizer.from_pretrained(self.tmpdirname, **kwargs)
-
-    def get_input_output_texts(self):
+    def get_input_output_texts(self, tokenizer):
         input_text = "lower newer"
         output_text = "lower newer"
         return input_text, output_text
 
     def test_full_tokenizer(self):
-        """ Adapted from Sennrich et al. 2015 and https://github.com/rsennrich/subword-nmt """
+        """Adapted from Sennrich et al. 2015 and https://github.com/rsennrich/subword-nmt"""
         tokenizer = XLMTokenizer(self.vocab_file, self.merges_file)
 
         text = "lower"
