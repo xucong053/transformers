@@ -52,7 +52,7 @@ from transformers.utils.versions import require_version
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.16.0.dev0")
+check_min_version("4.18.0.dev0")
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summarization/requirements.txt")
 
@@ -241,9 +241,6 @@ class DataTrainingArguments:
     def __post_init__(self):
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
             raise ValueError("Need either a dataset name or a training/validation file.")
-        elif self.lang is None:
-            raise ValueError("Need to specify the language.")
-
         else:
             if self.train_file is not None:
                 extension = self.train_file.split(".")[-1]
@@ -486,8 +483,6 @@ def main():
                 inputs.append(examples[text_column][i])
                 targets.append(examples[summary_column][i])
 
-        inputs = examples[text_column]
-        targets = examples[summary_column]
         inputs = [prefix + inp for inp in inputs]
         model_inputs = tokenizer(inputs, max_length=data_args.max_source_length, padding=padding, truncation=True)
 

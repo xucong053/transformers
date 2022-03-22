@@ -220,7 +220,7 @@ class FlaxBigBirdEmbeddings(nn.Module):
         token_type_embeddings = self.token_type_embeddings(token_type_ids.astype("i4"))
 
         if self.config.rescale_embeddings:
-            inputs_embeds *= self.config.hidden_size ** 0.5
+            inputs_embeds *= self.config.hidden_size**0.5
 
         # Sum all embeddings
         hidden_states = inputs_embeds + token_type_embeddings + position_embeds
@@ -2124,7 +2124,7 @@ class FlaxBigBirdForQuestionAnswering(FlaxBigBirdPreTrainedModel):
             if token_type_ids is None:
                 token_type_ids = (~logits_mask).astype("i4")
             logits_mask = jnp.expand_dims(logits_mask, axis=2)
-            logits_mask = jax.ops.index_update(logits_mask, jax.ops.index[:, 0], False)
+            logits_mask = logits_mask.at[:, 0].set(False)
 
         # init input tensors if not passed
         if token_type_ids is None:

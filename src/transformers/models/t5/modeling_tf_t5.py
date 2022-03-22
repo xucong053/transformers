@@ -21,7 +21,9 @@ import math
 import warnings
 from typing import Tuple
 
+import numpy as np
 import tensorflow as tf
+from tensorflow.compiler.tf2xla.python.xla import dynamic_update_slice
 
 from ...activations_tf import get_tf_activation
 from ...file_utils import (
@@ -33,7 +35,7 @@ from ...file_utils import (
 )
 from ...modeling_tf_outputs import (
     TFBaseModelOutput,
-    TFBaseModelOutputWithPast,
+    TFBaseModelOutputWithPastAndCrossAttentions,
     TFSeq2SeqLMOutput,
     TFSeq2SeqModelOutput,
 )
@@ -44,8 +46,8 @@ from ...modeling_tf_utils import (
     TFWrappedEmbeddings,
     input_processing,
     keras_serializable,
-    shape_list,
 )
+from ...tf_utils import shape_list
 from ...utils import logging
 from .configuration_t5 import T5Config
 
@@ -94,10 +96,10 @@ class TFT5DenseReluDense(tf.keras.layers.Layer):
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
         wi_initializer = tf.keras.initializers.RandomNormal(
-            mean=0, stddev=config.initializer_factor * (config.d_model ** -0.5)
+            mean=0, stddev=config.initializer_factor * (config.d_model**-0.5)
         )
         wo_initializer = tf.keras.initializers.RandomNormal(
-            mean=0, stddev=config.initializer_factor * (config.d_ff ** -0.5)
+            mean=0, stddev=config.initializer_factor * (config.d_ff**-0.5)
         )
         self.wi = tf.keras.layers.Dense(
             config.d_ff, use_bias=False, name="wi", kernel_initializer=wi_initializer
@@ -120,10 +122,10 @@ class TFT5GatedGeluDense(tf.keras.layers.Layer):
     def __init__(self, config, **kwargs):
         super().__init__(**kwargs)
         wi_initializer = tf.keras.initializers.RandomNormal(
-            mean=0, stddev=config.initializer_factor * (config.d_model ** -0.5)
+            mean=0, stddev=config.initializer_factor * (config.d_model**-0.5)
         )
         wo_initializer = tf.keras.initializers.RandomNormal(
-            mean=0, stddev=config.initializer_factor * (config.d_ff ** -0.5)
+            mean=0, stddev=config.initializer_factor * (config.d_ff**-0.5)
         )
         self.wi_0 = tf.keras.layers.Dense(
             config.d_ff, use_bias=False, name="wi_0", kernel_initializer=wi_initializer
@@ -179,6 +181,7 @@ class TFT5Attention(tf.keras.layers.Layer):
         self.output_attentions = config.output_attentions
 
         self.relative_attention_num_buckets = config.relative_attention_num_buckets
+        self.relative_attention_max_distance = config.relative_attention_max_distance
         self.d_model = config.d_model
         self.key_value_proj_dim = config.d_kv
         self.n_heads = config.num_heads
@@ -189,16 +192,16 @@ class TFT5Attention(tf.keras.layers.Layer):
             mean=0, stddev=config.initializer_factor * ((self.inner_dim * self.key_value_proj_dim) ** -0.5)
         )
         k_initializer = tf.keras.initializers.RandomNormal(
-            mean=0, stddev=config.initializer_factor * (self.inner_dim ** -0.5)
+            mean=0, stddev=config.initializer_factor * (self.inner_dim**-0.5)
         )
         v_initializer = tf.keras.initializers.RandomNormal(
-            mean=0, stddev=config.initializer_factor * (self.inner_dim ** -0.5)
+            mean=0, stddev=config.initializer_factor * (self.inner_dim**-0.5)
         )
         o_initializer = tf.keras.initializers.RandomNormal(
-            mean=0, stddev=config.initializer_factor * (self.inner_dim ** -0.5)
+            mean=0, stddev=config.initializer_factor * (self.inner_dim**-0.5)
         )
         self.relative_attention_bias_initializer = tf.keras.initializers.RandomNormal(
-            mean=0, stddev=config.initializer_factor * (self.inner_dim ** -0.5)
+            mean=0, stddev=config.initializer_factor * (self.inner_dim**-0.5)
         )
 
         self.q = tf.keras.layers.Dense(
@@ -285,6 +288,7 @@ class TFT5Attention(tf.keras.layers.Layer):
             relative_position,
             bidirectional=(not self.is_decoder),
             num_buckets=self.relative_attention_num_buckets,
+            max_distance=self.relative_attention_max_distance,
         )
         values = tf.gather(
             self.relative_attention_bias, relative_position_bucket
@@ -771,6 +775,7 @@ class TFT5MainLayer(tf.keras.layers.Layer):
         present_key_value_states = () if inputs["use_cache"] and self.is_decoder else None
         all_hidden_states = () if inputs["output_hidden_states"] else None
         all_attentions = () if inputs["output_attentions"] else None
+        all_cross_attentions = () if (inputs["output_attentions"] and self.is_decoder) else None
         position_bias = None
         encoder_decoder_position_bias = None
 
@@ -814,6 +819,8 @@ class TFT5MainLayer(tf.keras.layers.Layer):
 
             if inputs["output_attentions"]:
                 all_attentions = all_attentions + (layer_outputs[3],)
+                if self.is_decoder:
+                    all_cross_attentions = all_cross_attentions + (layer_outputs[5],)
 
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.dropout(hidden_states, training=inputs["training"])
@@ -831,14 +838,17 @@ class TFT5MainLayer(tf.keras.layers.Layer):
                 outputs = outputs + (all_hidden_states,)
             if inputs["output_attentions"]:
                 outputs = outputs + (all_attentions,)
-            return outputs  # last-layer hidden state, (all hidden states), (all attentions)
+                if self.is_decoder:
+                    outputs + (all_cross_attentions,)
+            return outputs  # last-layer hidden state, (past_key_values), (all hidden states), (all attentions), (all_cross_attentions)
 
         if self.is_decoder:
-            return TFBaseModelOutputWithPast(
+            return TFBaseModelOutputWithPastAndCrossAttentions(
                 last_hidden_state=hidden_states,
                 past_key_values=present_key_value_states,
                 hidden_states=all_hidden_states,
                 attentions=all_attentions,
+                cross_attentions=all_cross_attentions,
             )
         else:
             return TFBaseModelOutput(
@@ -1250,20 +1260,19 @@ class TFT5Model(TFT5PreTrainedModel):
             return_dict=inputs["return_dict"],
             training=inputs["training"],
         )
+        past = decoder_outputs[1] if inputs["use_cache"] else None
 
         if not inputs["return_dict"]:
-            past = (inputs["encoder_outputs"], decoder_outputs[1]) if inputs["use_cache"] else None
             if past is not None:
                 decoder_outputs = decoder_outputs[:1] + (past,) + decoder_outputs[2:]
             return decoder_outputs + inputs["encoder_outputs"]
-
-        past = (inputs["encoder_outputs"].to_tuple(), decoder_outputs[1]) if inputs["use_cache"] else None
 
         return TFSeq2SeqModelOutput(
             last_hidden_state=decoder_outputs.last_hidden_state,
             past_key_values=past,
             decoder_hidden_states=decoder_outputs.hidden_states,
             decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
             encoder_last_hidden_state=inputs["encoder_outputs"].last_hidden_state,
             encoder_hidden_states=inputs["encoder_outputs"].hidden_states,
             encoder_attentions=inputs["encoder_outputs"].attentions,
@@ -1273,6 +1282,7 @@ class TFT5Model(TFT5PreTrainedModel):
         pkv = tf.convert_to_tensor(output.past_key_values[1:]) if self.config.use_cache else None
         dec_hs = tf.convert_to_tensor(output.decoder_hidden_states) if self.config.output_hidden_states else None
         dec_attns = tf.convert_to_tensor(output.decoder_attentions) if self.config.output_attentions else None
+        cross_attns = tf.convert_to_tensor(output.cross_attentions) if self.config.output_attentions else None
         enc_hs = tf.convert_to_tensor(output.encoder_hidden_states) if self.config.output_hidden_states else None
         enc_attns = tf.convert_to_tensor(output.encoder_attentions) if self.config.output_attentions else None
 
@@ -1282,6 +1292,7 @@ class TFT5Model(TFT5PreTrainedModel):
             decoder_hidden_states=dec_hs,
             decoder_attentions=dec_attns,
             encoder_last_hidden_state=output.encoder_last_hidden_state,
+            cross_attentions=cross_attns,
             encoder_hidden_states=enc_hs,
             encoder_attentions=enc_attns,
         )
@@ -1465,17 +1476,17 @@ class TFT5ForConditionalGeneration(TFT5PreTrainedModel, TFCausalLanguageModeling
 
         # T5v1.1 does not tie output word embeddings and thus does not require downscaling
         if self.config.tie_word_embeddings:
-            sequence_output = sequence_output * (self.model_dim ** -0.5)
+            sequence_output = sequence_output * (self.model_dim**-0.5)
             logits = self.shared(sequence_output, mode="linear")
         else:
             logits = self.lm_head(sequence_output)
 
         logits = tf.cast(logits, tf.float32)
 
-        loss = None if inputs["labels"] is None else self.compute_loss(inputs["labels"], logits)
+        loss = None if inputs["labels"] is None else self.hf_compute_loss(inputs["labels"], logits)
 
+        past = decoder_outputs[1] if inputs["use_cache"] else None
         if not inputs["return_dict"]:
-            past = (inputs["encoder_outputs"], decoder_outputs[1]) if inputs["use_cache"] else None
             if past is not None:
                 decoder_outputs = decoder_outputs[:1] + (past,) + decoder_outputs[2:]
             output = (logits,) + decoder_outputs[1:] + inputs["encoder_outputs"]
@@ -1500,14 +1511,13 @@ class TFT5ForConditionalGeneration(TFT5PreTrainedModel, TFCausalLanguageModeling
                 attentions=attentions,
             )
 
-        past = (inputs["encoder_outputs"].to_tuple(), decoder_outputs[1]) if inputs["use_cache"] else None
-
         return TFSeq2SeqLMOutput(
             loss=loss,
             logits=logits,
             past_key_values=past,
             decoder_hidden_states=decoder_outputs.hidden_states,
             decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
             encoder_last_hidden_state=inputs["encoder_outputs"].last_hidden_state,
             encoder_hidden_states=inputs["encoder_outputs"].hidden_states,
             encoder_attentions=inputs["encoder_outputs"].attentions,
@@ -1517,6 +1527,7 @@ class TFT5ForConditionalGeneration(TFT5PreTrainedModel, TFCausalLanguageModeling
         pkv = tf.convert_to_tensor(output.past_key_values[1:]) if self.config.use_cache else None
         dec_hs = tf.convert_to_tensor(output.decoder_hidden_states) if self.config.output_hidden_states else None
         dec_attns = tf.convert_to_tensor(output.decoder_attentions) if self.config.output_attentions else None
+        cross_attns = tf.convert_to_tensor(output.cross_attentions) if self.config.output_attentions else None
         enc_hs = tf.convert_to_tensor(output.encoder_hidden_states) if self.config.output_hidden_states else None
         enc_attns = tf.convert_to_tensor(output.encoder_attentions) if self.config.output_attentions else None
 
@@ -1525,6 +1536,7 @@ class TFT5ForConditionalGeneration(TFT5PreTrainedModel, TFCausalLanguageModeling
             past_key_values=pkv,
             decoder_hidden_states=dec_hs,
             decoder_attentions=dec_attns,
+            cross_attentions=cross_attns,
             encoder_last_hidden_state=output.encoder_last_hidden_state,
             encoder_hidden_states=enc_hs,
             encoder_attentions=enc_attns,
@@ -1532,65 +1544,123 @@ class TFT5ForConditionalGeneration(TFT5PreTrainedModel, TFCausalLanguageModeling
 
     def prepare_inputs_for_generation(
         self,
-        inputs,
-        past,
-        attention_mask,
+        input_ids,
+        past=None,
+        attention_mask=None,
+        decoder_attention_mask=None,
+        head_mask=None,
+        decoder_head_mask=None,
         use_cache=None,
-        **kwargs,
+        encoder_outputs=None,
+        **kwargs
     ):
-        assert past is not None, "past has to be defined for encoder_outputs"
-
-        # first step
-        if len(past) < 2:
-            encoder_outputs, past_key_values = past, None
-        else:
-            encoder_outputs, past_key_values = past[0], past[1]
-        if "encoder_hidden_states" in kwargs:
-            encoder_outputs = (*encoder_outputs, kwargs["encoder_hidden_states"])
-        if "encoder_attentions" in kwargs:
-            encoder_outputs = (*encoder_outputs, kwargs["encoder_attentions"])
 
         # cut decoder_input_ids if past is used
-        if past_key_values is not None:
-            inputs = inputs[:, -1:]
+        if past is not None:
+            input_ids = input_ids[:, -1:]
 
         return {
-            "input_ids": None,  # inputs don't have to be defined, but still need to be passed to make Keras.layer.__call__ happy
-            "decoder_input_ids": inputs,  # inputs are the decoder_input_ids
-            "past_key_values": past_key_values,
+            "input_ids": None,  # needs to be passed to make Keras.layer.__call__ happy
+            "decoder_input_ids": input_ids,
+            "past_key_values": past,
             "encoder_outputs": encoder_outputs,
             "attention_mask": attention_mask,
+            "decoder_attention_mask": decoder_attention_mask,
+            "head_mask": head_mask,
+            "decoder_head_mask": decoder_head_mask,
             "use_cache": use_cache,
         }
+
+    def _update_model_kwargs_for_xla_generation(self, outputs, model_kwargs, current_pos, max_length):
+        # TODO(Pvp, Joao, Matt) - this function can be cleaned a bit and refactored
+        # quite some duplicated code patterns it seems
+        # also the `attention_mask` is currently used in a somewhat hacky to
+        # correctly influence the `past_key_values` - not sure if this is the way to go
+        # Let's keep that for a future PR.
+        past = outputs.past_key_values
+        is_past_initialized = model_kwargs.pop("past", None) is not None
+        decoder_attention_mask = model_kwargs.pop("decoder_attention_mask", None)
+        batch_size = past[0][0].shape[0]
+
+        if not is_past_initialized:
+            # past[0].shape[3] is seq_length of prompt
+            num_padding_values = max_length - past[0][0].shape[2] - 1
+
+            padding_values = np.zeros((4, 2), dtype=np.int32)
+            padding_values[2, 1] = num_padding_values
+            padding_values = tf.constant(padding_values)
+
+            new_past = ()
+            for past_layer in past:
+                new_past_layer = list(past_layer)
+                for i in range(len(new_past_layer[:2])):
+                    new_past_layer[i] = tf.pad(past_layer[i], padding_values)
+                new_past += (tuple(new_past_layer),)
+
+            # 1 one for decoder_start_token_id, Zeros for the currently-unfilled locations in the past tensor, ones for the actual input_ids
+            decoder_attention_mask = tf.concat(
+                [
+                    tf.ones((batch_size, 1), dtype=tf.int32),
+                    tf.zeros((batch_size, num_padding_values), dtype=tf.int32),
+                    tf.ones((batch_size, 1), dtype=tf.int32),
+                ],
+                axis=1,
+            )
+        else:
+            slice_start_base = tf.constant([0, 0, 1, 0])
+            decoder_attention_mask_update_slice = tf.ones((batch_size, 1), dtype=decoder_attention_mask.dtype)
+            # correct 5 here
+            new_past_index = current_pos - 1
+
+            new_past = ()
+            for past_layer in past:
+                new_past_layer = list(past_layer)
+                for i in range(len(new_past_layer[:2])):
+                    update_slice = past_layer[i][:, :, -1:]
+                    # Write the last slice to the first open location in the padded past array
+                    # and then truncate the last slice off the array
+                    new_past_layer[i] = dynamic_update_slice(
+                        past_layer[i][:, :, :-1], update_slice, slice_start_base * new_past_index
+                    )
+                new_past += (tuple(new_past_layer),)
+
+            update_start = tf.constant([0, 1], dtype=tf.int32) * new_past_index
+            decoder_attention_mask = dynamic_update_slice(
+                decoder_attention_mask, decoder_attention_mask_update_slice, update_start
+            )
+
+        # set `attention_mask` and `past`
+        model_kwargs["decoder_attention_mask"] = decoder_attention_mask
+        model_kwargs["past"] = new_past
+
+        return model_kwargs
 
     def prepare_decoder_input_ids_from_labels(self, labels: tf.Tensor):
         return self._shift_right(labels)
 
-    def _reorder_cache(self, past, beam_idx) -> Tuple:
+    def _reorder_cache(self, past, beam_idx):
         # if decoder past is not included in output
         # speedy decoding is disabled and no need to reorder
-
-        if len(past) < 2:
+        if past is None:
             logger.warning("You might want to consider setting `use_cache=True` to speed up decoding")
             return past
 
-        decoder_past = past[1]
-        past = (past[0],)
         reordered_decoder_past = ()
-
-        for layer_past_states in decoder_past:
+        for layer_past_states in past:
             # get the correct batch idx from layer past batch dim
             # batch dim of `past` is at 2nd position
             reordered_layer_past_states = ()
             for layer_past_state in layer_past_states:
                 # need to set correct `past` for each of the four key / value states
-                reordered_layer_past_states = reordered_layer_past_states + (tf.gather(layer_past_state, beam_idx),)
+                reordered_layer_past_states = reordered_layer_past_states + (
+                    tf.gather(layer_past_state, beam_idx, axis=0),
+                )
 
-            assert shape_list(reordered_layer_past_states[0]) == shape_list(layer_past_states[0])
+            assert reordered_layer_past_states[0].shape == layer_past_states[0].shape
             assert len(reordered_layer_past_states) == len(layer_past_states)
 
             reordered_decoder_past = reordered_decoder_past + (reordered_layer_past_states,)
-        return past + (reordered_decoder_past,)
+        return reordered_decoder_past
 
 
 @add_start_docstrings(
